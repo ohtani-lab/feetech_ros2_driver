@@ -15,6 +15,13 @@
 #include <vector>
 
 namespace feetech_ros2_driver {
+namespace {
+constexpr int kStsSignBitLoad = 10;
+constexpr int kStsSignBitCurrent = 15;
+constexpr int kStsMaximumAccelerationAddress = 85;
+constexpr uint8_t kStsPhaseBit4ClearMask = 0xef;
+}  // namespace
+
 #if HARDWARE_INTERFACE_VERSION_GTE(4, 34, 0)
 CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::HardwareComponentInterfaceParams& params) {
   if (hardware_interface::SystemInterface::on_init(params) != CallbackReturn::SUCCESS) {
@@ -140,13 +147,43 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       return CallbackReturn::ERROR;
     }
 
+    const auto model_number = communication_protocol_->read_model_number(joint_ids_[i]);
+    if (!model_number) {
+      spdlog::error("FeetechHardwareInterface::configure_joints_ read_model_number -> {}", model_number.error());
+      return CallbackReturn::ERROR;
+    }
+    const auto model_name = feetech_driver::get_model_name(model_number.value());
+    if (!model_name) {
+      spdlog::error("FeetechHardwareInterface::configure_joints_ get_model_name -> {}", model_name.error());
+      return CallbackReturn::ERROR;
+    }
+
+    if (model_name.value() == "STS3215") {
+      std::array<uint8_t, 1> phase{};
+      if (const auto result = communication_protocol_->read(joint_ids_[i], SMS_STS_PHASE, &phase); !result) {
+        spdlog::error("FeetechHardwareInterface::configure_joints_ read phase -> {}", result.error());
+        return CallbackReturn::ERROR;
+      }
+      const auto phase_without_bit_4 = static_cast<uint8_t>(phase[0] & kStsPhaseBit4ClearMask);
+      if (phase_without_bit_4 != phase[0]) {
+        const auto result = communication_protocol_->write(
+            joint_ids_[i], SMS_STS_PHASE, std::experimental::make_array(phase_without_bit_4));
+        if (!result) {
+          spdlog::error("FeetechHardwareInterface::configure_joints_ write phase -> {}", result.error());
+          return CallbackReturn::ERROR;
+        }
+      }
+    }
+
     // Single-byte parameters (0-255)
     for (const auto& [parameter_name, address] : {std::pair{"p_coefficient", SMS_STS_P_COEF},
                                                   {"d_coefficient", SMS_STS_D_COEF},
                                                   {"i_coefficient", SMS_STS_I_COEF},
+                                                  {"operating_mode", SMS_STS_MODE},
                                                   {"overload_torque", SMS_STS_OVERLOAD_TORQUE},
                                                   {"return_delay_time", SMS_STS_RETURN_DELAY},
-                                                  {"acceleration", SMS_STS_ACC}}) {
+                                                  {"acceleration", SMS_STS_ACC},
+                                                  {"maximum_acceleration", kStsMaximumAccelerationAddress}}) {
       if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
         const auto result = communication_protocol_->write(
             joint_ids_[i], address, std::experimental::make_array(static_cast<uint8_t>(std::stoi(param_it->second))));
@@ -234,9 +271,21 @@ std::vector<hardware_interface::StateInterface> FeetechHardwareInterface::export
   std::vector<hardware_interface::StateInterface> state_interfaces;
   state_hw_positions_.resize(info_.joints.size(), 0.0);
   state_hw_velocities_.resize(info_.joints.size(), 0.0);
+  state_hw_loads_.resize(info_.joints.size(), 0.0);
+  state_hw_voltages_.resize(info_.joints.size(), 0.0);
+  state_hw_temperatures_.resize(info_.joints.size(), 0.0);
+  state_hw_status_.resize(info_.joints.size(), 0.0);
+  state_hw_moving_.resize(info_.joints.size(), 0.0);
+  state_hw_currents_.resize(info_.joints.size(), 0.0);
   for (uint i = 0; i < info_.joints.size(); i++) {
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &state_hw_positions_[i]);
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &state_hw_velocities_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "load", &state_hw_loads_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "voltage", &state_hw_voltages_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "temperature", &state_hw_temperatures_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "status", &state_hw_status_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "moving", &state_hw_moving_[i]);
+    state_interfaces.emplace_back(info_.joints[i].name, "current", &state_hw_currents_[i]);
   }
 
   return state_interfaces;
@@ -256,8 +305,8 @@ std::vector<hardware_interface::CommandInterface> FeetechHardwareInterface::expo
 
 hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Time& /* time */,
                                                                const rclcpp::Duration& /* period */) {
-  // 4 = 2 bytes for position + 2 bytes for speed
-  std::vector<std::array<uint8_t, 4>> data;
+  // Read position through current in one transaction. Reserved bytes are ignored.
+  std::vector<std::array<uint8_t, 15>> data;
   data.reserve(joint_ids_.size());
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
     spdlog::error("FeetechHardwareInterface::read -> {}", result.error());
@@ -268,8 +317,19 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
     state_hw_positions_[index] = feetech_driver::to_radians(
         feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[0], .high = readings[1]}) -
         feetech_driver::kStsMidpoint);
+    const int velocity =
+        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]});
+    const int load = feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[4], .high = readings[5]});
+    const int current =
+        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[13], .high = readings[14]});
     state_hw_velocities_[index] = feetech_driver::to_radians(
-        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}));
+        feetech_driver::decode_sign_magnitude(velocity, SMS_STS_SIGN_BIT_VELOCITY));
+    state_hw_loads_[index] = feetech_driver::decode_sign_magnitude(load, kStsSignBitLoad) / 1000.0;
+    state_hw_voltages_[index] = readings[6] * 0.1;
+    state_hw_temperatures_[index] = readings[7];
+    state_hw_status_[index] = readings[9];
+    state_hw_moving_[index] = readings[10];
+    state_hw_currents_[index] = feetech_driver::decode_sign_magnitude(current, kStsSignBitCurrent) * 0.0065;
   });
   return hardware_interface::return_type::OK;
 }
@@ -278,24 +338,24 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
                                                                 const rclcpp::Duration& /* period */) {
   // Create vectors only for joints that have command interfaces
   std::vector<uint8_t> commanded_joint_ids;
-  std::vector<int> commanded_positions;
-  std::vector<int> commanded_speeds;
-  std::vector<int> commanded_accelerations;
+  std::vector<std::array<uint8_t, 2>> commanded_positions;
 
   for (uint i = 0; i < info_.joints.size(); i++) {
     // Only include joints with command interfaces
     if (!info_.joints[i].command_interfaces.empty()) {
       commanded_joint_ids.push_back(joint_ids_[i]);
-      commanded_positions.push_back(feetech_driver::from_radians(hw_positions_[i]) + feetech_driver::kStsMidpoint);
-      commanded_speeds.push_back(2400);       // Default speed
-      commanded_accelerations.push_back(50);  // Default acceleration
+      std::array<uint8_t, 2> position{};
+      feetech_driver::to_sts(&position[0],
+                             &position[1],
+                             feetech_driver::from_radians(hw_positions_[i]) + feetech_driver::kStsMidpoint);
+      commanded_positions.push_back(position);
     }
   }
 
   // Only send commands if there are joints to command
   if (!commanded_joint_ids.empty()) {
-    const auto write_result = communication_protocol_->sync_write_position(
-        commanded_joint_ids, commanded_positions, commanded_speeds, commanded_accelerations);
+    const auto write_result =
+        communication_protocol_->sync_write(commanded_joint_ids, SMS_STS_GOAL_POSITION_L, commanded_positions);
     if (!write_result) {
       spdlog::error("FeetechHardwareInterface::write -> {}", write_result.error());
       return hardware_interface::return_type::ERROR;
