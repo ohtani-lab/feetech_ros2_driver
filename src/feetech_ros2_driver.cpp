@@ -309,8 +309,17 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   std::vector<std::array<uint8_t, 15>> data;
   data.reserve(joint_ids_.size());
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
-    spdlog::error("FeetechHardwareInterface::read -> {}", result.error());
-    return hardware_interface::return_type::ERROR;
+    const bool stop = read_failure_tracker_.record_failure();
+    if (stop) {
+      spdlog::error("FeetechHardwareInterface::read consecutive_failures={}/{} -> {}",
+                    read_failure_tracker_.consecutive_failures(), ReadFailureTracker::kMaxConsecutiveFailures,
+                    result.error());
+      return hardware_interface::return_type::ERROR;
+    }
+    spdlog::warn("FeetechHardwareInterface::read consecutive_failures={}/{}; retaining previous state -> {}",
+                 read_failure_tracker_.consecutive_failures(), ReadFailureTracker::kMaxConsecutiveFailures,
+                 result.error());
+    return hardware_interface::return_type::OK;
   }
   ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
     const auto& [index, readings] = values;
@@ -331,6 +340,7 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
     state_hw_moving_[index] = readings[10];
     state_hw_currents_[index] = feetech_driver::decode_sign_magnitude(current, kStsSignBitCurrent) * 0.0065;
   });
+  read_failure_tracker_.record_success();
   return hardware_interface::return_type::OK;
 }
 
@@ -366,8 +376,13 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
 }
 
 CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::State& /* previous_state */) {
+  read_failure_tracker_.reset_for_activation();
   // Time/Duration are not used
-  read(rclcpp::Time{}, rclcpp::Duration::from_seconds(0));
+  if (read(rclcpp::Time{}, rclcpp::Duration::from_seconds(0)) != hardware_interface::return_type::OK ||
+      !read_failure_tracker_.has_successful_read()) {
+    spdlog::error("FeetechHardwareInterface::on_activate: initial read failed; command positions not initialized");
+    return CallbackReturn::ERROR;
+  }
   // Set the initial command to current joint positions
   hw_positions_ = state_hw_positions_;
   return CallbackReturn::SUCCESS;

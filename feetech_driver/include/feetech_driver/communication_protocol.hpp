@@ -5,6 +5,7 @@
 #include <spdlog/spdlog.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <experimental/array>
 #include <feetech_driver/serial_port.hpp>
 #include <numeric>
@@ -160,36 +161,60 @@ class CommunicationProtocol {
     buffer[0] = 0xff;
     buffer[1] = 0xff;
 
-    auto request_result = serial_port_->write(buffer).and_then([&]() -> Result {
-      for (const uint8_t id : ids) {
-        if (auto result = serial_port_->write(std::experimental::make_array(id)); !result) {
-          return tl::make_unexpected(fmt::format("CommunicationProtocol::sync_read [{}]", result.error()));
-        }
-        request_checksum += id;
-      }
-      return serial_port_->write(std::experimental::make_array(static_cast<uint8_t>(~request_checksum)));
-    });
+    // A failed read can leave complete or partial responses in the input buffer.
+    // Position is sampled afresh, so discard those responses before the next request.
+    auto request_result = serial_port_->flashInputBuffer()
+                              .and_then([&] { return serial_port_->write(buffer); })
+                              .and_then([&]() -> Result {
+                                for (const uint8_t id : ids) {
+                                  if (auto result = serial_port_->write(std::experimental::make_array(id)); !result) {
+                                    return tl::make_unexpected(
+                                        fmt::format("CommunicationProtocol::sync_read [{}]", result.error()));
+                                  }
+                                  request_checksum += id;
+                                }
+                                return serial_port_->write(
+                                    std::experimental::make_array(static_cast<uint8_t>(~request_checksum)));
+                              });
 
     if (!request_result) {
       return request_result;
     }
 
     data->resize(ids.size());
+    std::vector<bool> seen(ids.size(), false);
     for (size_t i = 0; i < ids.size(); ++i) {
       std::array<uint8_t, 3> response_buffer{};  // ID, Effective Data length, Working status
+      std::array<uint8_t, N> response_data{};
       uint8_t checksum{};
       auto read_result = check_head()
                              .and_then([&] { return serial_port_->read(&response_buffer); })
-                             .and_then([&] { return serial_port_->read(&data->at(i)); })
+                             .and_then([&] { return serial_port_->read(&response_data); })
                              .and_then([&] { return serial_port_->read_byte(&checksum); });
       if (!read_result) {
         return tl::make_unexpected(fmt::format("CommunicationProtocol::sync_read [{}]", read_result.error()));
       }
-      const auto calculated_checksum = ~(sum_bytes(response_buffer) + sum_bytes(data->at(i)));
+      const auto calculated_checksum = ~(sum_bytes(response_buffer) + sum_bytes(response_data));
       if (static_cast<std::byte>(calculated_checksum) != static_cast<std::byte>(checksum)) {
         return tl::make_unexpected(fmt::format(
             "CommunicationProtocol::sync_read [calculated_checksum={}, checksum={}]", calculated_checksum, checksum));
       }
+      if (response_buffer[1] != N + 2) {
+        return tl::make_unexpected(fmt::format("CommunicationProtocol::sync_read [id={}, length={} != {}]",
+                                               response_buffer[0], response_buffer[1], N + 2));
+      }
+      const auto id = std::find(ids.begin(), ids.end(), response_buffer[0]);
+      if (id == ids.end()) {
+        return tl::make_unexpected(fmt::format("CommunicationProtocol::sync_read [unexpected id={}]",
+                                               response_buffer[0]));
+      }
+      const auto index = static_cast<size_t>(std::distance(ids.begin(), id));
+      if (seen[index]) {
+        return tl::make_unexpected(fmt::format("CommunicationProtocol::sync_read [duplicate id={}]",
+                                               response_buffer[0]));
+      }
+      seen[index] = true;
+      data->at(index) = response_data;
     }
     return {};
   }
